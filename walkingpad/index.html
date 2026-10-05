@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WalkingPad</title>
+<style>
+  :root {
+    --canvas: #fff; --surface: #f7f7f7; --line: #e5e5e5;
+    --ink: #0d0d0d; --muted: #6b6b6b; --warn: #b45309;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --canvas: #0d0d0d; --surface: #171717; --line: #262626;
+      --ink: #ececec; --muted: #9b9b9b; --warn: #f0b45a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--canvas); color: var(--ink);
+    font: 16px/1.5 system-ui, -apple-system, sans-serif;
+    font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
+  }
+  main { max-width: 48rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; }
+  header, .walk { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+  h1 { margin: 0; font-size: 1.125rem; }
+  h2 { margin: 0; font-size: .875rem; font-weight: 400; color: var(--muted); }
+  p { margin: 0; }
+  small, .muted { color: var(--muted); font-size: .875rem; }
+  [data-warn] { color: var(--warn); }
+  [hidden] { display: none !important; }
+  #status {
+    display: flex; align-items: center; gap: .5rem; padding: .25rem .75rem;
+    border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .875rem;
+  }
+  #status::before { content: ""; width: .375rem; height: .375rem; border-radius: 50%; background: currentColor; }
+  #status[data-on] { color: var(--ink); }
+  .today { margin-top: 3rem; }
+  .km { font-size: 4.5rem; font-weight: 600; letter-spacing: -.05em; line-height: 1.1; }
+  .km small { margin-left: .5rem; font-size: 1.5rem; letter-spacing: 0; }
+  .stats { display: flex; gap: 2.5rem; margin-top: 1.5rem; }
+  .stats b { display: block; font-size: 1.5rem; font-weight: 500; }
+  .card { margin-top: 2.5rem; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.5rem; }
+  .card + .card { margin-top: 1rem; }
+  .controls { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1.25rem 0 1rem; }
+  button, label {
+    display: inline-flex; align-items: center; gap: .25rem; min-height: 2.75rem; padding: 0 1.25rem;
+    border: 1px solid var(--line); border-radius: 999px; background: none; color: inherit; font: inherit; font-size: .875rem;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { background: var(--surface); }
+  button.primary { border-color: var(--ink); background: var(--ink); color: var(--canvas); }
+  button:disabled { opacity: .35; cursor: default; }
+  label { color: var(--muted); }
+  input { width: 2.75rem; border: 0; background: none; color: var(--ink); font: inherit; font-size: 1rem; text-align: right; outline: none; }
+  #connect { margin-bottom: 1rem; }
+  #unsupported { margin-bottom: 1rem; }
+  #command:empty { display: none; }
+  .walk { padding: .75rem 0; border-top: 1px solid var(--line); }
+  .walk:first-child { margin-top: .5rem; }
+  .walk > :last-child { white-space: nowrap; }
+  footer { margin-top: 2.5rem; }
+</style>
+
+<main>
+  <header>
+    <h1>WalkingPad</h1>
+    <span id="status" role="status">Not connected</span>
+  </header>
+
+  <section class="today">
+    <h2>Today</h2>
+    <div class="km"><span id="today-km">0.00</span><small>km</small></div>
+    <div class="stats">
+      <div><b id="today-time">0:00</b><small>Walking time</small></div>
+      <div><b id="today-steps">0</b><small>Steps</small></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <p id="unsupported" data-warn hidden>
+      This browser has no Bluetooth access. Use Chrome on Android, Mac, or Windows.
+      On iPhone, use the free Bluefy browser.
+    </p>
+    <button id="connect" class="primary">Connect treadmill</button>
+    <p id="live"></p>
+    <div class="controls">
+      <button id="start">Start</button>
+      <button id="stop" class="primary">Stop</button>
+      <label>Speed <input id="speed" type="number" min="0.5" max="6" step="0.1" value="1.5" inputmode="decimal"> km/h</label>
+      <button id="set-speed">Set speed</button>
+    </div>
+    <small>Start uses the treadmill's preset speed. Speed range: 0.5 to 6 km/h.</small>
+    <p id="command" role="status"></p>
+  </section>
+
+  <section class="card">
+    <header><h2>Walks</h2><button id="export">Download CSV</button></header>
+    <div id="walks"></div>
+  </section>
+
+  <footer class="muted">
+    Walks are saved in this browser only. Pauses under 5 minutes stay in the same walk.
+  </footer>
+</main>
+
+<script>
+  // Protocol documented by ph4r05/ph4-walkingpad: f7 a2 <command> <checksum> fd.
+  const SERVICE = 0xfe00, NOTIFY = 0xfe01, WRITE = 0xfe02;
+  const COUNTERS = ["duration_s", "distance_m", "steps"];
+  const $ = (id) => document.getElementById(id);
+  const now = () => Date.now() / 1000;
+  const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+  const sum = (bytes) => bytes.reduce((total, byte) => total + byte, 0);
+
+  function frame(...command) {
+    const bytes = [0xf7, 0xa2, ...command, 0, 0xfd];
+    bytes[bytes.length - 2] = sum(bytes.slice(1, -2)) % 256;
+    return new Uint8Array(bytes);
+  }
+
+  function decode(d) {
+    if (d.length < 20 || d[0] !== 0xf8 || d[1] !== 0xa2 || d.at(-1) !== 0xfd) return null;
+    if (sum(d.slice(1, -2)) % 256 !== d.at(-2)) return null;
+    const int = (i) => d[i] * 65536 + d[i + 1] * 256 + d[i + 2];
+    return {
+      belt_state: d[2], speed_kmh: d[3] / 10, manual_mode: d[4],
+      duration_s: int(5), distance_m: int(8) * 10, steps: int(11),
+    };
+  }
+
+  const db = JSON.parse(localStorage.getItem("walkingpad") || '{"walks": [], "previous": null}');
+  const moving = (r) => r.belt_state === 1 && r.speed_kmh > 0;
+
+  function record(at, reading) {
+    const previous = db.previous;
+    // The treadmill zeroes its counters after 10 stopped minutes, so 10+ idle minutes mean a new count.
+    const idle = previous && at - previous.at - (reading.duration_s - previous.duration_s);
+    const changed = previous && COUNTERS.some((k) => reading[k] !== previous[k]);
+    const reset = previous && (COUNTERS.some((k) => reading[k] < previous[k]) || (changed && idle >= 600));
+    const delta = Object.fromEntries(COUNTERS.map((k) =>
+      [k, previous && !reset ? reading[k] - previous[k] : reading[k]]));
+    const progressed = COUNTERS.some((k) => delta[k]);
+    if (moving(reading) || progressed) {
+      // Counters gained while disconnected keep their totals; their timing is approximate.
+      const gap = previous ? at - previous.at > 10 : progressed;
+      const start = gap ? at - delta.duration_s : at;
+      let walk = db.walks.at(-1);
+      if (!walk || start - walk.ended_at > 300) {
+        walk = { started_at: start, ended_at: at, duration_s: 0, distance_m: 0, steps: 0, gaps: 0 };
+        db.walks.push(walk);
+      }
+      walk.ended_at = at;
+      for (const k of COUNTERS) walk[k] += delta[k];
+      walk.gaps += Number(gap);
+    }
+    db.previous = { ...reading, at };
+    localStorage.setItem("walkingpad", JSON.stringify(db));
+  }
+
+  const live = { device: null, writer: null, connected: false, reading: null, at: 0, note: "" };
+  let queue = Promise.resolve(), lastWrite = 0, busy = false, running = false;
+
+  function send(bytes) {
+    const writer = live.writer;
+    const task = queue.then(async () => {
+      await sleep(700 - (performance.now() - lastWrite));
+      if (!writer || writer !== live.writer) throw new Error("Treadmill disconnected");
+      const write = writer.writeValueWithoutResponse ?? writer.writeValue;
+      const timeout = sleep(3000).then(() => { throw new Error("Write timed out"); });
+      await Promise.race([write.call(writer, bytes), timeout]);
+      lastWrite = performance.now();
+    });
+    queue = task.catch(() => {});
+    return task;
+  }
+
+  function receive(event) {
+    const v = event.target.value;
+    const reading = decode(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+    if (!reading) return;
+    live.reading = reading;
+    live.at = now();
+    record(live.at, reading);
+    render();
+  }
+
+  async function connect() {
+    try {
+      live.device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [SERVICE] }, { namePrefix: "KS-" }, { namePrefix: "WalkingPad" }, { namePrefix: "KingSmith" }],
+        optionalServices: [SERVICE],
+      });
+    } catch {
+      return;
+    }
+    navigator.storage?.persist?.();
+    if (!running) keepConnected();
+  }
+
+  async function keepConnected() {
+    running = true;
+    while (live.device) {
+      try {
+        await stream(live.device);
+      } catch (error) {
+        live.note = live.device ? "Connection lost. Reconnecting…" : error.message;
+      }
+      live.connected = false;
+      live.writer = null;
+      render();
+      if (live.device) await sleep(5000);
+    }
+    running = false;
+  }
+
+  async function stream(device) {
+    live.note = "Connecting…";
+    render();
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE).catch(() => {
+      device.gatt.disconnect();
+      live.device = null;
+      throw new Error(device.name + " uses an unsupported Bluetooth protocol.");
+    });
+    const notify = await service.getCharacteristic(NOTIFY);
+    live.writer = await service.getCharacteristic(WRITE);
+    notify.addEventListener("characteristicvaluechanged", receive);
+    await notify.startNotifications();
+    live.connected = true;
+    live.note = "";
+    keepAwake();
+    render();
+    // Background tabs slow timers, so count unanswered polls instead of seconds.
+    let unanswered = 0;
+    while (device.gatt.connected) {
+      const before = live.at;
+      await send(frame(0, 0));
+      await sleep(1000);
+      unanswered = live.at > before ? 0 : unanswered + 1;
+      if (unanswered >= 10) {
+        device.gatt.disconnect();
+        throw new Error("No readings. Reconnecting…");
+      }
+    }
+    throw new Error("Bluetooth disconnected. Reconnecting…");
+  }
+
+  async function keepAwake() {
+    if (document.visibilityState === "visible") await navigator.wakeLock?.request("screen").catch(() => {});
+  }
+
+  const fresh = () => live.connected && now() - live.at < 5;
+  const speed = () => Number($("speed").value);
+
+  function blocker(action) {
+    const r = live.reading;
+    if (!live.connected) return "Treadmill disconnected.";
+    if (action === "stop") return null;
+    if (!fresh()) return "Wait for fresh treadmill readings.";
+    if (r.manual_mode !== 1 && !(action === "start" && r.manual_mode === 2)) return "Select manual mode with the remote first.";
+    if (action === "start" && ![0, 4, 5].includes(r.belt_state)) return "Start works when the belt is stopped.";
+    if (action === "speed" && r.belt_state !== 1) return "Start the belt before setting its speed.";
+    if (action === "speed" && !(speed() >= 0.5 && speed() <= 6)) return "Choose 0.5 to 6 km/h.";
+    return null;
+  }
+
+  async function control(action) {
+    const problem = blocker(action);
+    if (problem) return say(problem);
+    busy = true;
+    render();
+    try {
+      if (action === "start" && live.reading.manual_mode === 2) {
+        await send(frame(2, 1));
+        const deadline = Date.now() + 3000;
+        while (live.reading.manual_mode !== 1) {
+          if (Date.now() > deadline) throw new Error("No manual mode");
+          await sleep(100);
+        }
+      }
+      await send(action === "start" ? frame(4, 1) : frame(1, action === "speed" ? Math.round(speed() * 10) : 0));
+      say({ start: "Start", stop: "Stop", speed: "Speed" }[action] + " sent. Check the belt.");
+    } catch {
+      say("Could not confirm delivery. Check the belt. The command was not retried.");
+    } finally {
+      busy = false;
+      render();
+    }
+  }
+
+  const say = (text) => { $("command").textContent = text; };
+  const km = (m) => (m / 1000).toFixed(2);
+  const clock = (s) => Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  const when = (t) => new Date(t * 1000).toLocaleString(undefined,
+    { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
+
+  function render() {
+    const r = live.reading, on = fresh();
+    $("status").textContent = on ? "Connected" : live.device ? "Reconnecting" : "Not connected";
+    $("status").toggleAttribute("data-on", on);
+    $("connect").hidden = live.connected;
+    $("live").textContent = !on ? live.note || "Tap Connect during a walk or up to 10 minutes after it."
+      : moving(r) ? "Belt running · " + r.speed_kmh.toFixed(1) + " km/h · " + km(r.distance_m) + " km · " + clock(r.duration_s)
+      : "Belt stopped. Recording starts automatically.";
+    $("start").disabled = busy || !!blocker("start");
+    $("stop").disabled = busy || !!blocker("stop");
+    $("set-speed").disabled = busy || !!blocker("speed");
+
+    const midnight = new Date().setHours(0, 0, 0, 0) / 1000;
+    const today = db.walks.filter((w) => w.started_at >= midnight);
+    const total = (k) => today.reduce((t, w) => t + w[k], 0);
+    $("today-km").textContent = km(total("distance_m"));
+    $("today-time").textContent = clock(total("duration_s"));
+    $("today-steps").textContent = total("steps").toLocaleString();
+
+    $("walks").innerHTML = db.walks.slice(-20).reverse().map((w) => {
+      const note = w.gaps ? "<small data-warn>Recovered from treadmill counters. Times approximate.</small>"
+        : now() - w.ended_at < 300 ? "<small>In progress</small>"
+        : "<small>" + w.steps.toLocaleString() + " steps</small>";
+      return '<div class="walk"><div><div>' + when(w.started_at) + "</div>" + note + "</div>"
+        + "<div>" + km(w.distance_m) + " km · " + clock(w.duration_s) + "</div></div>";
+    }).join("") || '<p class="muted">Your first walk will appear here.</p>';
+  }
+
+  function exportCsv() {
+    const iso = (t) => new Date(t * 1000).toISOString();
+    const rows = [["start", "end", "duration_s", "distance_m", "steps", "recovered"],
+      ...db.walks.map((w) => [iso(w.started_at), iso(w.ended_at), w.duration_s, w.distance_m, w.steps, w.gaps > 0])];
+    const file = new Blob([rows.map((row) => row.join(",")).join("\n") + "\n"], { type: "text/csv" });
+    const link = Object.assign(document.createElement("a"),
+      { href: URL.createObjectURL(file), download: "walkingpad-walks.csv" });
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }
+
+  if (!navigator.bluetooth) {
+    $("unsupported").hidden = false;
+    $("connect").disabled = true;
+  }
+  $("connect").onclick = connect;
+  $("start").onclick = () => control("start");
+  $("stop").onclick = () => control("stop");
+  $("set-speed").onclick = () => control("speed");
+  $("speed").oninput = render;
+  $("export").onclick = exportCsv;
+  document.addEventListener("visibilitychange", () => live.connected && keepAwake());
+  setInterval(render, 1000);
+  render();
+</script>
+</html>
